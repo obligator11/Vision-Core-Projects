@@ -52,45 +52,49 @@ class AudioManager:
 class PlayerSkeleton:
     def __init__(self):
         self.mp_pose = mp.solutions.pose
-        # High confidence thresholds to prevent jitter
         self.pose = self.mp_pose.Pose(
             model_complexity=1,
             min_detection_confidence=0.7,
             min_tracking_confidence=0.7
         )
-        self.segments = [] # Holds active line segments as numpy arrays
+        self.segments = []
+        self.core_rect = None  # NEW: hitbox for collisions
 
     def process_frame(self, frame, render_rect):
-        """
-        Extracts pose, maps normalized coordinates to screen space, 
-        and updates the dynamic NumPy line segments.
-        """
         results = self.pose.process(frame)
         self.segments.clear()
-        
-        ox, oy, sw, sh = render_rect
+        self.core_rect = None
 
+        ox, oy, sw, sh = render_rect
         if not results.pose_landmarks:
             return []
 
         landmarks = results.pose_landmarks.landmark
         drawn_points = {}
 
-        # Map landmarks to Pygame screen space
         for idx, lm in enumerate(landmarks):
             if lm.visibility > 0.5:
-                # Direct mapping (frame is already mirrored in the main loop)
                 screen_x = int(lm.x * sw) + ox
                 screen_y = int(lm.y * sh) + oy
                 drawn_points[idx] = np.array([screen_x, screen_y])
 
-        # Create numpy line segments based on pose connections
         for connection in self.mp_pose.POSE_CONNECTIONS:
             start_idx, end_idx = connection
             if start_idx in drawn_points and end_idx in drawn_points:
-                p1 = drawn_points[start_idx]
-                p2 = drawn_points[end_idx]
-                self.segments.append((p1, p2))
+                self.segments.append((drawn_points[start_idx], drawn_points[end_idx]))
+
+        # NEW: build a small core hitbox from shoulders + hips (11,12,23,24)
+        core_ids = [11, 12, 23, 24]
+        core_pts = [drawn_points[i] for i in core_ids if i in drawn_points]
+        if len(core_pts) >= 2:
+            xs = [p[0] for p in core_pts]
+            ys = [p[1] for p in core_pts]
+            pad = 20
+            self.core_rect = pygame.Rect(
+                min(xs) - pad, min(ys) - pad,
+                (max(xs) - min(xs)) + pad * 2,
+                (max(ys) - min(ys)) + pad * 2
+            )
 
         return self.segments
 
@@ -113,42 +117,48 @@ class Obstacle:
         self.win_w = win_w
         self.win_h = win_h
         
-        # Spawn logic based on type
+        # Default initialization to prevent AttributeError
+        self.rect = pygame.Rect(0, 0, 50, 50)
+        self.vel = np.array([0.0, 0.0])
+        self.color = (255, 255, 255)
+        self.time_offset = random.uniform(0, 10)
+        
+        # Specific spawn logic
         if self.type == "LASER":
             self.rect = pygame.Rect(win_w, random.randint(100, win_h - 100), 150, 20)
-            self.vel = np.array([-random.uniform(8, 15), 0])
+            self.vel = np.array([-random.uniform(20, 30), 0])
             self.color = (255, 50, 50)
             
         elif self.type == "BUZZSAW":
             self.rect = pygame.Rect(-100, random.randint(200, win_h - 200), 80, 80)
-            self.vel = np.array([random.uniform(5, 10), 0])
+            self.vel = np.array([random.uniform(12, 18), 0])
             self.color = (255, 150, 0)
-            self.origin_y = self.rect.y
-            self.time_offset = random.uniform(0, 10)
             
         elif self.type == "ANVIL":
             self.rect = pygame.Rect(random.randint(100, win_w - 100), -100, 100, 80)
-            self.vel = np.array([0, random.uniform(10, 18)])
+            self.vel = np.array([0, random.uniform(18, 26)])
             self.color = (100, 100, 150)
 
     def update(self):
-        # Apply velocity
+        # Apply velocity with sine wave for buzzsaw
         if self.type == "BUZZSAW":
-            # Sine wave movement
             self.vel[1] = math.sin(time.time() * 5 + self.time_offset) * 8
             
-        self.rect.x += int(self.vel[0])
-        self.rect.y += int(self.vel[1])
+        # Ensure self.rect exists before modifying
+        if hasattr(self, 'rect'):
+            self.rect.x += int(self.vel[0])
+            self.rect.y += int(self.vel[1])
         
         # Kill if off screen
         if (self.rect.right < -200 or self.rect.left > self.win_w + 200 or 
-            self.rect.top > self.win_h + 200):
+            self.rect.top > self.win_h + 200 or self.rect.bottom > self.win_h + 200):
             self.active = False
 
     def draw(self, surface):
-        pygame.draw.rect(surface, self.color, self.rect)
-        if self.type == "LASER":
-            pygame.draw.rect(surface, (255, 200, 200), self.rect.inflate(-10, -10))
+        if hasattr(self, 'rect'):
+            pygame.draw.rect(surface, self.color, self.rect)
+            if self.type == "LASER":
+                pygame.draw.rect(surface, (255, 200, 200), self.rect.inflate(-10, -10))
 
 # ---------------------------------------------------------
 # MAIN GAME ENGINE
@@ -189,14 +199,14 @@ class GameManager:
         return offset_x, offset_y, new_w, new_h
 
     def handle_collisions(self, segments):
-        """NumPy/Pygame integrated intersection math."""
+        """Checks only the player's core (torso/hip) hitbox against obstacles."""
+        core = self.skeleton.core_rect
+        if core is None:
+            return
         for obs in self.obstacles:
-            for p1, p2 in segments:
-                # Pygame's clipline natively handles fast AABB/Line intersection
-                if obs.rect.clipline(p1[0], p1[1], p2[0], p2[1]):
-                    self.trigger_hit_fx()
-                    obs.active = False # Destroy on hit to prevent multi-trigger
-                    break 
+            if obs.active and obs.rect.colliderect(core):
+                self.trigger_hit_fx()
+                obs.active = False
 
     def trigger_hit_fx(self):
         self.audio.play("hit")

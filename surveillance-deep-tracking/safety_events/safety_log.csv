@@ -1,0 +1,15 @@
+timestamp,track_id,violation_type,detail,snapshot_file
+2026-07-05_00-49-06,0,PPE,"no-hardhat, no-vest",violation_0_PPE_2026-07-05_00-49-06.jpg
+2026-07-05_00-49-07,1,PPE,no-vest,violation_1_PPE_2026-07-05_00-49-07.jpg
+2026-07-05_00-49-17,1,PPE,no-vest,violation_1_PPE_2026-07-05_00-49-17.jpg
+2026-07-05_00-49-27,1,PPE,no-vest,violation_1_PPE_2026-07-05_00-49-27.jpg
+2026-07-05_00-49-28,5,PPE,no-vest,violation_5_PPE_2026-07-05_00-49-28.jpg
+2026-07-05_00-49-31,6,PPE,no-vest,violation_6_PPE_2026-07-05_00-49-31.jpg
+2026-07-05_00-49-37,1,PPE,no-vest,violation_1_PPE_2026-07-05_00-49-37.jpg
+2026-07-05_00-49-42,7,PPE,no-vest,violation_7_PPE_2026-07-05_00-49-42.jpg
+2026-07-05_00-49-46,8,PPE,no-vest,violation_8_PPE_2026-07-05_00-49-46.jpg
+2026-07-05_00-49-48,1,PPE,no-vest,violation_1_PPE_2026-07-05_00-49-48.jpg
+2026-07-05_00-49-51,9,PPE,no-vest,violation_9_PPE_2026-07-05_00-49-51.jpg
+2026-07-05_00-49-55,10,PPE,no-vest,violation_10_PPE_2026-07-05_00-49-55.jpg
+2026-07-05_00-49-58,1,PPE,no-vest,violation_1_PPE_2026-07-05_00-49-58.jpg
+2026-07-05_00-49-59,11,PPE,no-vest,violation_11_PPE_2026-07-05_00-49-59.jpg
