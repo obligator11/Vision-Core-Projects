@@ -1,8 +1,6 @@
-import math
 import random
 import sys
 import time
-from collections import deque
 
 import cv2
 import numpy as np
@@ -17,10 +15,21 @@ FPS = 30
 CAM_INDEX = 0
 SAMPLE_RATE = 22050
 
-PUNCH_START_VELOCITY = 0.9     # normalized units/sec to consider a punch "started"
-PUNCH_END_VELOCITY = 0.25      # velocity below this ends the swing window
+# A real punch here means "toward the camera", i.e. mostly z motion. These
+# thresholds are on FORWARD velocity (rate the wrist gets closer to the
+# camera), not raw 3D speed - see MIN_FORWARD_DOMINANCE below for why.
+PUNCH_START_VELOCITY = 0.9     # normalized units/sec of forward motion to start a punch
+PUNCH_END_VELOCITY = 0.2       # forward velocity below this ends the swing window
+MIN_FORWARD_DOMINANCE = 0.4    # forward speed must be >= this fraction of total speed
+                                # (this is what rejects arm-raises/waves: fast but not toward the camera)
 COOLDOWN_AFTER_PUNCH = 0.35
 MAX_POWER_THRESHOLD = 88.0
+
+POS_SMOOTHING_ALPHA = 0.5      # smoothing on wrist position (1.0 = no smoothing, lower = smoother)
+MIN_SWING_DURATION = 0.07      # seconds - real punches take longer than a single noisy frame
+MIN_SWING_FORWARD_DISTANCE = 0.03  # normalized units of forward travel required to count as a punch
+MIN_LANDMARK_VISIBILITY = 0.5  # minimum visibility to trust the wrist landmark
+SHOW_DEBUG = False              # toggled at runtime with the D key
 
 # ----------------------------------------------------------------------------
 # INIT
@@ -42,6 +51,10 @@ pose = mp_pose.Pose(model_complexity=1, min_detection_confidence=0.5,
 cap = cv2.VideoCapture(CAM_INDEX)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 960)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+try:
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # not all backends support this; harmless if ignored
+except Exception:
+    pass
 if not cap.isOpened():
     print("ERROR: could not open webcam.")
     sys.exit(1)
@@ -95,9 +108,9 @@ def frame_to_surface(frame_bgr, w, h):
     return pygame.surfarray.make_surface(frame_rgb)
 
 
-def get_wrist_3d(landmarks, side="RIGHT"):
+def get_wrist_sample(landmarks, side="RIGHT"):
     lm = landmarks[mp_pose.PoseLandmark[f"{side}_WRIST"].value]
-    return np.array([lm.x, lm.y, lm.z])
+    return np.array([lm.x, lm.y, lm.z]), lm.visibility
 
 
 # ----------------------------------------------------------------------------
@@ -105,12 +118,13 @@ def get_wrist_3d(landmarks, side="RIGHT"):
 # ----------------------------------------------------------------------------
 class GameState:
     def __init__(self):
+        self.smoothed_pos = None
         self.prev_pos = None
         self.prev_time = None
         self.in_swing = False
-        self.swing_start_pos = None
-        self.swing_path_length = 0.0
-        self.peak_velocity = 0.0
+        self.swing_start_time = None
+        self.swing_forward_distance = 0.0
+        self.peak_forward_velocity = 0.0
         self.last_punch_time = 0
         self.meter_value = 0.0       # live display value (eases toward target)
         self.meter_target = 0.0
@@ -120,17 +134,31 @@ class GameState:
         self.result_text = ""
         self.result_until = 0
 
+        # for the debug overlay only
+        self.last_forward_speed = 0.0
+        self.last_total_speed = 0.0
+        self.last_dominance = 0.0
+
     def reset_best(self):
         self.best_power = 0.0
+
+    def clear_tracking(self):
+        """Wipe raw tracking state after the wrist is lost, so a stale
+        position doesn't create a fake velocity spike when it reappears."""
+        self.smoothed_pos = None
+        self.prev_pos = None
+        self.prev_time = None
+        self.in_swing = False
 
 
 state = GameState()
 
 
-def score_punch(peak_velocity, path_length, now):
-    # normalize into a 0-100 power score (tuned empirically for typical punch speeds)
-    velocity_component = min(60, peak_velocity * 30)
-    distance_component = min(40, path_length * 250)
+def score_punch(peak_forward_velocity, forward_distance, now):
+    # normalize into a 0-100 power score (tuned empirically - adjust freely
+    # once you've watched the debug numbers for a few real punches)
+    velocity_component = min(60, peak_forward_velocity * 30)
+    distance_component = min(40, forward_distance * 400)
     power = velocity_component + distance_component
     power = max(0.0, min(100.0, power))
 
@@ -157,28 +185,56 @@ def score_punch(peak_velocity, path_length, now):
     state.result_until = now + 1.0
 
 
-def update_punch_tracking(wrist_pos, now):
+def update_punch_tracking(raw_pos, visibility, now):
+    if visibility < MIN_LANDMARK_VISIBILITY:
+        return  # don't feed a low-confidence sample into the tracker
+
+    if state.smoothed_pos is None:
+        state.smoothed_pos = raw_pos
+    else:
+        state.smoothed_pos = POS_SMOOTHING_ALPHA * raw_pos + (1 - POS_SMOOTHING_ALPHA) * state.smoothed_pos
+    wrist_pos = state.smoothed_pos
+
     if state.prev_pos is None:
         state.prev_pos, state.prev_time = wrist_pos, now
         return
 
     dt = max(1e-3, now - state.prev_time)
-    velocity = np.linalg.norm(wrist_pos - state.prev_pos) / dt
+    delta = wrist_pos - state.prev_pos
 
-    if not state.in_swing and velocity > PUNCH_START_VELOCITY and now - state.last_punch_time > COOLDOWN_AFTER_PUNCH:
+    total_speed = np.linalg.norm(delta) / dt
+    # mediapipe's z shrinks as the landmark gets closer to the camera, so a
+    # decreasing z is "forward" motion - i.e. an actual punch toward the lens.
+    forward_speed = max(0.0, -delta[2] / dt)
+    dominance = forward_speed / total_speed if total_speed > 1e-6 else 0.0
+
+    state.last_forward_speed = forward_speed
+    state.last_total_speed = total_speed
+    state.last_dominance = dominance
+
+    # This dominance check is the key piece: it's what separates "you punched
+    # toward the camera" from "you quickly raised/waved your hand" - both can
+    # be fast, but only a punch is mostly forward motion.
+    is_punch_like = forward_speed > PUNCH_START_VELOCITY and dominance >= MIN_FORWARD_DOMINANCE
+
+    if not state.in_swing and is_punch_like and now - state.last_punch_time > COOLDOWN_AFTER_PUNCH:
         state.in_swing = True
-        state.swing_start_pos = wrist_pos
-        state.swing_path_length = 0.0
-        state.peak_velocity = velocity
+        state.swing_start_time = now
+        state.swing_forward_distance = 0.0
+        state.peak_forward_velocity = forward_speed
 
     if state.in_swing:
-        state.swing_path_length += np.linalg.norm(wrist_pos - state.prev_pos)
-        state.peak_velocity = max(state.peak_velocity, velocity)
+        state.swing_forward_distance += max(0.0, -delta[2])
+        state.peak_forward_velocity = max(state.peak_forward_velocity, forward_speed)
 
-        if velocity < PUNCH_END_VELOCITY:
+        if forward_speed < PUNCH_END_VELOCITY:
             state.in_swing = False
             state.last_punch_time = now
-            score_punch(state.peak_velocity, state.swing_path_length, now)
+            duration = now - state.swing_start_time
+            # Discard noise blips: a real punch takes measurable time and
+            # covers measurable forward distance.
+            if duration >= MIN_SWING_DURATION and state.swing_forward_distance >= MIN_SWING_FORWARD_DISTANCE:
+                score_punch(state.peak_forward_velocity, state.swing_forward_distance, now)
 
     state.prev_pos, state.prev_time = wrist_pos, now
 
@@ -218,72 +274,95 @@ def draw_hud(w, h, wrist_screen_pos, person_seen):
         result = font_big.render(state.result_text, True, color)
         screen.blit(result, (w / 2 - result.get_width() / 2, h / 2 - 150))
 
-    title = font_small.render("PUNCH BAG POWER METER - throw a punch toward the camera!",
-                               True, (255, 255, 255))
+    title = font_small.render(
+        "PUNCH BAG POWER METER - throw a punch toward the camera!  |  R: reset best  D: debug",
+        True, (255, 255, 255))
     screen.blit(title, (w / 2 - title.get_width() / 2, h - 26))
+
+    if SHOW_DEBUG:
+        lines = [
+            f"forward speed: {state.last_forward_speed:.2f}  (start > {PUNCH_START_VELOCITY}, end < {PUNCH_END_VELOCITY})",
+            f"total speed:   {state.last_total_speed:.2f}",
+            f"dominance:     {state.last_dominance:.2f}  (needs >= {MIN_FORWARD_DOMINANCE} to count as a punch)",
+            f"in_swing: {state.in_swing}   forward distance: {state.swing_forward_distance:.3f}",
+        ]
+        for i, line in enumerate(lines):
+            lbl = font_small.render(line, True, (255, 255, 0))
+            screen.blit(lbl, (20, 90 + i * 22))
 
 
 # ----------------------------------------------------------------------------
 # MAIN LOOP
 # ----------------------------------------------------------------------------
 def main():
-    global screen
+    global screen, SHOW_DEBUG
     w, h = BASE_SIZE
     running = True
+    last_seen_time = None
 
-    while running:
-        now = time.time()
+    try:
+        while running:
+            now = time.time()
 
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-            elif event.type == pygame.VIDEORESIZE:
-                w, h = max(400, event.w), max(300, event.h)
-                screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
-            elif event.type == pygame.KEYDOWN:
-                if event.key in (pygame.K_q, pygame.K_ESCAPE):
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
                     running = False
-                elif event.key == pygame.K_r:
-                    state.reset_best()
+                elif event.type == pygame.VIDEORESIZE:
+                    w, h = max(400, event.w), max(300, event.h)
+                    screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_q, pygame.K_ESCAPE):
+                        running = False
+                    elif event.key == pygame.K_r:
+                        state.reset_best()
+                    elif event.key == pygame.K_d:
+                        SHOW_DEBUG = not SHOW_DEBUG
 
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        frame = cv2.flip(frame, 1)
+            ok, frame = cap.read()
+            if not ok:
+                clock.tick(FPS)
+                continue
+            frame = cv2.flip(frame, 1)
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = pose.process(rgb)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = pose.process(rgb)
 
-        person_seen = False
-        wrist_screen_pos = None
-        if results.pose_landmarks:
-            person_seen = True
-            landmarks = results.pose_landmarks.landmark
-            wrist_3d = get_wrist_3d(landmarks, "RIGHT")
-            update_punch_tracking(wrist_3d, now)
-            wrist_screen_pos = (int(wrist_3d[0] * w), int(wrist_3d[1] * h))
+            person_seen = False
+            wrist_screen_pos = None
+            if results.pose_landmarks:
+                person_seen = True
+                last_seen_time = now
+                landmarks = results.pose_landmarks.landmark
+                wrist_pos, visibility = get_wrist_sample(landmarks, "RIGHT")
+                update_punch_tracking(wrist_pos, visibility, now)
+                if visibility >= MIN_LANDMARK_VISIBILITY:
+                    wrist_screen_pos = (int(wrist_pos[0] * w), int(wrist_pos[1] * h))
+            else:
+                if last_seen_time is not None and now - last_seen_time > 0.5:
+                    state.clear_tracking()
+                    last_seen_time = None
 
-        # screen shake offset
-        offset_x, offset_y = 0, 0
-        if now < state.shake_until:
-            offset_x = random.randint(-state.shake_strength, state.shake_strength)
-            offset_y = random.randint(-state.shake_strength, state.shake_strength)
+            # screen shake offset
+            offset_x, offset_y = 0, 0
+            if now < state.shake_until:
+                offset_x = random.randint(-state.shake_strength, state.shake_strength)
+                offset_y = random.randint(-state.shake_strength, state.shake_strength)
 
-        surf = frame_to_surface(frame, w, h)
-        screen.fill((0, 0, 0))
-        screen.blit(surf, (offset_x, offset_y))
-        dim = pygame.Surface((w, h), pygame.SRCALPHA)
-        dim.fill((0, 0, 0, 70))
-        screen.blit(dim, (0, 0))
+            surf = frame_to_surface(frame, w, h)
+            screen.fill((0, 0, 0))
+            screen.blit(surf, (offset_x, offset_y))
+            dim = pygame.Surface((w, h), pygame.SRCALPHA)
+            dim.fill((0, 0, 0, 70))
+            screen.blit(dim, (0, 0))
 
-        draw_hud(w, h, wrist_screen_pos, person_seen)
+            draw_hud(w, h, wrist_screen_pos, person_seen)
 
-        pygame.display.flip()
-        clock.tick(FPS)
-
-    cap.release()
-    pose.close()
-    pygame.quit()
+            pygame.display.flip()
+            clock.tick(FPS)
+    finally:
+        cap.release()
+        pose.close()
+        pygame.quit()
 
 
 if __name__ == "__main__":
